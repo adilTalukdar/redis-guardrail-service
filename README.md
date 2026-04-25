@@ -1,4 +1,8 @@
-# SpringGrid
+# Redis Guardrail Service
+
+This project is a simple backend service that uses Redis to add guardrails or limits to actions such as posting comments or sending notifications. It's written in Java using Spring Boot. The database is PostgreSQL, and Redis is used for rate limits, counters, and some notification logic.
+
+Think of it like a basic “social media” backend, where you can create users, bots, posts, comments, and likes — with special logic so bots can’t overload posts or reply too fast, all enforced by Redis!
 
 A production-ready Spring Boot 3.x microservice built with Java 21 and Maven, featuring Redis-backed atomic guardrails, virality scoring, and a notification engine for a bot-powered social posting platform.
 
@@ -62,7 +66,7 @@ src/main/java/com/grid/app/
 ## Prerequisites
 
 - Java 21
-- Maven 3.9+
+- Maven 
 - Docker and Docker Compose (for PostgreSQL and Redis)
 
 ---
@@ -72,7 +76,6 @@ src/main/java/com/grid/app/
 ### Step 1 — Start PostgreSQL and Redis
 
 **Option A: Docker Compose (recommended)**
-
 ```bash
 docker-compose up -d
 ```
@@ -117,62 +120,13 @@ Spring Boot will auto-create all tables via `spring.jpa.hibernate.ddl-auto=updat
 
 Import `SpringGrid.postman_collection.json` into Postman for ready-to-use requests.
 
-### Sample Requests
-
-**Create User**
-```json
-POST /api/users
-{ "username": "john", "isPremium": true }
-```
-
-**Create Bot**
-```json
-POST /api/bots
-{ "name": "BotAlpha", "personaDescription": "Friendly bot" }
-```
-
-**Create Post**
-```json
-POST /api/posts
-{ "authorId": 1, "authorType": "USER", "content": "Hello world" }
-```
-
-**Add Bot Comment** (triggers all Redis guardrails)
-```json
-POST /api/posts/1/comments
-{
-  "authorId": 1,
-  "authorType": "BOT",
-  "botId": 1,
-  "userId": 1,
-  "content": "Nice post!",
-  "depthLevel": 1
-}
-```
-
-**Like Post**
-```json
-POST /api/posts/1/like
-{ "userId": 1 }
-```
-
----
-
-## HTTP Status Codes
-
-| Status | Meaning                                      |
-|--------|----------------------------------------------|
-| 200    | Success (like post)                          |
-| 201    | Created (user, bot, post, comment)           |
-| 400    | Bad Request (depth > 20, post not found)     |
-| 429    | Too Many Requests (horizontal/cooldown cap)  |
-| 500    | Internal Server Error                        |
 
 ---
 
 ## Virality Score (Redis)
 
-Redis key: `post:{postId}:virality_score`
+- Redis key: `post:{postId}:virality_score`
+- Points are computed as follows:
 
 | Interaction Type | Points Added |
 |------------------|--------------|
@@ -186,7 +140,7 @@ Uses `StringRedisTemplate.opsForValue().increment()` for atomic increments.
 
 ## Redis Guardrails (Bot Comments)
 
-Guardrails are enforced in this order for every bot comment:
+Guardrails are enforced in this order every time a bot comments:
 
 ### 1. Vertical Cap (depth check)
 If `depthLevel > 20`, the request is rejected immediately with HTTP 400 — no Redis I/O occurs.
@@ -194,13 +148,14 @@ If `depthLevel > 20`, the request is rejected immediately with HTTP 400 — no R
 ### 2. Cooldown Cap
 Redis key: `cooldown:bot_{botId}:human_{userId}`
 
-If the key exists → HTTP 429 (bot replied to this user too recently, 10-minute window).
-If not → the key is set with TTL 600 seconds after the comment is saved.
+- If the key exists → HTTP 429 (bot replied to this user too recently, 10-minute window).
+- If not → key is set with TTL 600 seconds after the comment is saved.
 
-### 3. Horizontal Cap
-Redis key: `post:{postId}:bot_count`
+### 3. Horizontal Cap (Atomic Lock)
 
-A Lua script is executed atomically via `RedisTemplate.execute(RedisScript)`:
+**Thread Safety & Atomicity of the Horizontal Cap:**
+
+The horizontal cap ensures that no more than 100 bot replies can be made to a post. This mechanism uses a Redis Lua script executed atomically in Redis:
 
 ```lua
 local current = redis.call('INCR', KEYS[1])
@@ -211,17 +166,20 @@ end
 return current
 ```
 
-If result is `-1` → HTTP 429 (100-bot limit reached).
+#### Explanation of Thread Safety (Atomic Lock in Phase 2)
 
-### Thread Safety Explanation
+**Approach:**
+- The horizontal cap is enforced by running the above Lua script via `RedisTemplate.execute()`.
+- All mutating operations (`INCR`, check, optional `DECR`) are bundled inside the single Lua script and sent as one command to the Redis server.
 
-The Horizontal Cap Lua script is the only place where a check-then-act pattern is required, and it is guaranteed race-condition-free by Redis's own architecture.
+**Guaranteeing Thread Safety:**
+- **No JVM-level synchronization is used or needed.**
+- **Redis executes commands with single-threaded semantics:** Every Lua script execution is atomic — it runs to completion before any other Redis command (even from other clients) can execute.
+- Thus, even with hundreds of concurrent threads or clients, there is **zero chance of a race condition**.
+- If the post hits the 100-bot cap, the Lua script rolls back (`DECR`) and the comment is rejected with HTTP 429. All concurrent attempts are serialized by Redis itself.
 
-Redis is **single-threaded** for command execution. When `RedisTemplate.execute(RedisScript)` sends the Lua script, Redis executes the entire script — `INCR`, the boundary check, and the optional `DECR` — as a single **indivisible, atomic operation**. No other client command can interleave between these steps.
-
-This means that even with **200 concurrent JVM threads** all calling the endpoint simultaneously, each thread's Lua script is queued and executed one at a time inside Redis. The counter will increment from 1 to 100 sequentially, and the 101st (and beyond) will always receive `-1` — the limit is enforced precisely at 100 with **zero possibility of a race condition**.
-
-This is the gold standard for distributed rate limiting: no JVM-level synchronization, no distributed locks, just Redis's native single-threaded Lua execution.
+**Summary:**  
+Thread safety and correct Atomic Lock behavior are **guaranteed by Redis's built-in command queue and atomic Lua script execution**. There are no distributed races, and no possibility of “lost updates” or “phantom increments”, regardless of application load.
 
 ---
 
@@ -229,12 +187,13 @@ This is the gold standard for distributed rate limiting: no JVM-level synchroniz
 
 After a bot comment is saved, `NotificationService.handleBotNotification(userId, botName)` runs:
 
-- **If cooldown key `user:{userId}:notif_cooldown` EXISTS** → message is pushed to Redis List `user:{userId}:pending_notifs`
-- **If cooldown key does NOT exist** → notification is sent immediately (logged), and cooldown is set for 900 seconds (15 minutes)
+- If cooldown key `user:{userId}:notif_cooldown` EXISTS → message is pushed to Redis List `user:{userId}:pending_notifs`
+- If cooldown key does NOT exist → notification is sent immediately (logged) and cooldown is set for 900 seconds (15 minutes)
 
 ### Cron Sweeper
 
 `NotificationScheduler` runs every 5 minutes (`fixedRate = 300000`):
+
 1. Scans for all `user:*:pending_notifs` keys
 2. Drains each list atomically (range + delete)
 3. Logs a summary: `"Summarized Push Notification: <first_message> and <N> others interacted with your posts."`
@@ -243,13 +202,13 @@ After a bot comment is saved, `NotificationService.handleBotNotification(userId,
 
 ## Redis Keys Reference
 
-| Key Pattern                          | Purpose                         | TTL         |
-|--------------------------------------|---------------------------------|-------------|
-| `post:{postId}:virality_score`       | Running virality score          | No TTL      |
-| `post:{postId}:bot_count`            | Count of bot comments on post   | No TTL      |
-| `cooldown:bot_{botId}:human_{userId}`| Per-bot-per-user cooldown       | 600 seconds |
-| `user:{userId}:notif_cooldown`       | Notification send cooldown      | 900 seconds |
-| `user:{userId}:pending_notifs`       | Queued notification messages    | No TTL      |
+| Key Pattern                           | Purpose                         | TTL         |
+|---------------------------------------|---------------------------------|-------------|
+| `post:{postId}:virality_score`        | Running virality score          | No TTL      |
+| `post:{postId}:bot_count`             | Count of bot comments on post   | No TTL      |
+| `cooldown:bot_{botId}:human_{userId}` | Per-bot-per-user cooldown       | 600 seconds |
+| `user:{userId}:notif_cooldown`        | Notification send cooldown      | 900 seconds |
+| `user:{userId}:pending_notifs`        | Queued notification messages    | No TTL      |
 
 ---
 
